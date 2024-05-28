@@ -1,13 +1,16 @@
 use crate::{
     framed::{FrameConsumer, FrameProducer},
+    walker_registration::WakerRegistration,
     Error, Result,
 };
 use core::{
     cell::UnsafeCell,
     cmp::min,
+    future::Future,
     marker::PhantomData,
     mem::{forget, transmute, MaybeUninit},
     ops::{Deref, DerefMut},
+    pin::Pin,
     ptr::NonNull,
     result::Result as CoreResult,
     slice::from_raw_parts_mut,
@@ -15,6 +18,7 @@ use core::{
         AtomicBool, AtomicUsize,
         Ordering::{AcqRel, Acquire, Release},
     },
+    task::{Context, Poll},
 };
 #[derive(Debug)]
 /// A backing structure for a BBQueue. Can be used to create either
@@ -49,6 +53,12 @@ pub struct BBBuffer<const N: usize> {
 
     /// Have we already split?
     already_split: AtomicBool,
+
+    // Woken when commit is called
+    read_waker: WakerRegistration,
+
+    // Woken when release is called
+    grant_waker: WakerRegistration,
 }
 
 unsafe impl<const A: usize> Sync for BBBuffer<A> {}
@@ -281,6 +291,12 @@ impl<const A: usize> BBBuffer<A> {
 
             // We haven't split at the start
             already_split: AtomicBool::new(false),
+
+            // No waker so far
+            read_waker: WakerRegistration::new(),
+
+            // No waker so far
+            grant_waker: WakerRegistration::new(),
         }
     }
 }
@@ -511,6 +527,21 @@ impl<'a, const N: usize> Producer<'a, N> {
             to_commit: 0,
         })
     }
+
+    pub fn grant_exact_async(&'_ mut self, sz: usize) -> GrantExactFuture<'a, '_, N> {
+        GrantExactFuture { prod: self, sz }
+    }
+
+    pub fn grant_remaining_async(&'_ mut self, sz: usize) -> GrantRemainingFuture<'a, '_, N> {
+        GrantRemainingFuture { prod: self, sz }
+    }
+
+    pub fn grant_max_remaining_async(
+        &'_ mut self,
+        sz: usize,
+    ) -> GrantMaxRemainingFuture<'a, '_, N> {
+        GrantMaxRemainingFuture { prod: self, sz }
+    }
 }
 
 /// `Consumer` is the primary interface for reading data from a `BBBuffer`.
@@ -654,6 +685,16 @@ impl<'a, const N: usize> Consumer<'a, N> {
             bbq: self.bbq,
             to_release: 0,
         })
+    }
+
+    /// Async version of [Self::read]
+    pub fn read_async(&'_ mut self) -> GrantReadFuture<'a, '_, N> {
+        GrantReadFuture { cons: self }
+    }
+
+    /// Async version of [Self::split_read]
+    pub fn split_read_async(&'_ mut self) -> GrantSplitReadFuture<'a, '_, N> {
+        GrantSplitReadFuture { cons: self }
     }
 }
 
@@ -1101,6 +1142,122 @@ impl<'a, const N: usize> DerefMut for GrantR<'a, N> {
         self.buf
     }
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Asynchronous interfaces
+////////////////////////////////////////////////////////////////////////////////////////////////////
+pub struct GrantRemainingFuture<'b, 'a, const N: usize> {
+    prod: &'b mut Producer<'a, N>,
+    sz: usize,
+}
+
+impl<'b, 'a, const N: usize> Future for GrantRemainingFuture<'b, 'a, N> {
+    type Output = Result<GrantW<'a, N>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let sz = self.sz;
+        match self.prod.grant_max_remaining(sz) {
+            Ok(grant) => Poll::Ready(Ok(grant)),
+            Err(e) => match e {
+                Error::GrantInProgress | Error::InsufficientSize => {
+                    unsafe { self.prod.bbq.as_mut().grant_waker.register(cx.waker()) };
+                    Poll::Pending
+                }
+                _ => Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+pub struct GrantMaxRemainingFuture<'b, 'a, const N: usize> {
+    prod: &'b mut Producer<'a, N>,
+    sz: usize,
+}
+
+impl<'b, 'a, const N: usize> Future for GrantMaxRemainingFuture<'b, 'a, N> {
+    type Output = Result<GrantW<'a, N>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let sz = self.sz;
+        match self.prod.grant_max_remaining(sz) {
+            Ok(grant) => Poll::Ready(Ok(grant)),
+            Err(e) => match e {
+                Error::GrantInProgress | Error::InsufficientSize => {
+                    unsafe { self.prod.bbq.as_mut().grant_waker.register(cx.waker()) };
+                    Poll::Pending
+                }
+                _ => Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+pub struct GrantExactFuture<'b, 'a, const N: usize> {
+    prod: &'b mut Producer<'a, N>,
+    sz: usize,
+}
+
+impl<'b, 'a, const N: usize> Future for GrantExactFuture<'b, 'a, N> {
+    type Output = Result<GrantW<'a, N>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let sz = self.sz;
+        match self.prod.grant_exact(sz) {
+            Ok(grant) => Poll::Ready(Ok(grant)),
+            Err(e) => match e {
+                Error::GrantInProgress | Error::InsufficientSize => {
+                    unsafe { self.prod.bbq.as_mut().grant_waker.register(cx.waker()) };
+                    Poll::Pending
+                }
+                _ => Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+pub struct GrantReadFuture<'a, 'b, const N: usize> {
+    cons: &'b mut Consumer<'a, N>,
+}
+
+impl<'a, 'b, const N: usize> Future for GrantReadFuture<'a, 'b, N> {
+    type Output = Result<GrantR<'a, N>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.cons.read() {
+            Ok(grant) => Poll::Ready(Ok(grant)),
+            Err(e) => match e {
+                Error::GrantInProgress | Error::InsufficientSize => {
+                    unsafe { self.cons.bbq.as_mut().read_waker.register(cx.waker()) };
+                    Poll::Pending
+                }
+                _ => Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+pub struct GrantSplitReadFuture<'a, 'b, const N: usize> {
+    cons: &'b mut Consumer<'a, N>,
+}
+
+impl<'a, 'b, const N: usize> Future for GrantSplitReadFuture<'a, 'b, N> {
+    type Output = Result<SplitGrantR<'a, N>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.cons.split_read() {
+            Ok(grant) => Poll::Ready(Ok(grant)),
+            Err(e) => match e {
+                Error::GrantInProgress | Error::InsufficientSize => {
+                    unsafe { self.cons.bbq.as_mut().read_waker.register(cx.waker()) };
+                    Poll::Pending
+                }
+                _ => Poll::Ready(Err(e)),
+            },
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "thumbv6")]
 mod atomic {
